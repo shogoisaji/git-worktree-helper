@@ -262,12 +262,15 @@ main() {
     local unique_selected=()
     for item in "${selected_worktrees[@]}"; do
         local found=false
-        for existing in "${unique_selected[@]}"; do
-            if [[ "$item" == "$existing" ]]; then
-                found=true
-                break
-            fi
-        done
+        # Add a guard for the inner loop to prevent unbound variable errors on older bash
+        if [ ${#unique_selected[@]} -gt 0 ]; then
+            for existing in "${unique_selected[@]}"; do
+                if [[ "$item" == "$existing" ]]; then
+                    found=true
+                    break
+                fi
+            done
+        fi
         if [[ "$found" == false ]]; then
             unique_selected+=("$item")
         fi
