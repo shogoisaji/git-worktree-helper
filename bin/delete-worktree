@@ -1,0 +1,305 @@
+#!/bin/bash
+
+# Git Worktree 複数削除スクリプト v3.2 (安定版)
+# このスクリプトは常に対話モードで起動し、複数のGit worktreeとブランチを削除します
+
+set -euo pipefail
+
+# カラー定義
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# エラーメッセージを表示して終了
+error_exit() {
+    echo -e "${RED}エラー: $1${NC}" >&2
+    exit 1
+}
+
+# 成功メッセージを表示
+success_msg() {
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+# 警告メッセージを表示
+warning_msg() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+# 情報メッセージを表示
+info_msg() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+# worktree一覧を表示
+show_worktrees() {
+    echo "現在のworktree一覧:"
+    if ! git worktree list 2>/dev/null; then
+        echo "  (worktreeがありません)"
+    fi
+    echo
+}
+
+# 番号選択でworktreeを選択
+select_multiple_worktrees() {
+    # worktree一覧を取得
+    local worktrees=()
+    local main_worktree
+    main_worktree=$(git rev-parse --show-toplevel)
+    
+    # worktree list から非メインワークツリーのみを取得
+    # メインワークツリーとパスが異なるもののみを選択
+    while IFS= read -r path; do
+        if [[ -n "$path" ]]; then
+            # パスを正規化して比較
+            local real_path
+            real_path=$(realpath "$path" 2>/dev/null || echo "$path")
+            local real_main
+            real_main=$(realpath "$main_worktree" 2>/dev/null || echo "$main_worktree")
+            
+            # メインワークツリーでないもののみを追加
+            if [[ "$real_path" != "$real_main" ]]; then
+                worktrees+=("$path")
+            fi
+        fi
+    done < <(git worktree list --porcelain | awk '/^worktree / {path=$2; for(i=3;i<=NF;i++) path=path" "$i; print path}')
+
+    if [ ${#worktrees[@]} -eq 0 ]; then
+        info_msg "削除可能なworktreeがありません。"
+        exit 0
+    fi
+
+    # worktree一覧を表示
+    echo "削除可能なworktree一覧:"
+    for i in "${!worktrees[@]}"; do
+        printf "  %d) %s\n" "$((i + 1))" "${worktrees[$i]}"
+    done
+    echo
+    
+    # 複数選択を受け付ける
+    echo "削除するworktreeの番号を入力してください（複数の場合はスペース区切り、例: 1 3）:"
+    echo "すべて削除する場合は 'all' を入力してください。"
+    echo "キャンセルする場合は 'q' を入力してください。"
+    read -p "選択: " selection
+    
+    # 入力をチェック
+    if [[ "$selection" == "q" || "$selection" == "Q" ]]; then
+        echo "キャンセルしました。"
+        return 0
+    fi
+    
+    local to_delete=()
+    
+    if [[ "$selection" == "all" || "$selection" == "ALL" ]]; then
+        # すべて選択
+        to_delete=("${worktrees[@]}")
+    else
+        # 番号で選択
+        for num in $selection; do
+            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#worktrees[@]}" ]; then
+                to_delete+=("${worktrees[$((num - 1))]}")
+            else
+                warning_msg "無効な番号: $num (1-${#worktrees[@]}の範囲で入力してください)"
+            fi
+        done
+    fi
+    
+    # 重複を削除
+    local unique_to_delete=()
+    for item in "${to_delete[@]}"; do
+        local found=false
+        for existing in "${unique_to_delete[@]}"; do
+            if [[ "$item" == "$existing" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            unique_to_delete+=("$item")
+        fi
+    done
+    
+    # 配列が空でない場合のみ出力
+    if [ ${#unique_to_delete[@]} -gt 0 ]; then
+        printf '%s\n' "${unique_to_delete[@]}"
+    fi
+}
+
+# worktreeとブランチを削除 (確認なし、一括処理用)
+perform_delete() {
+    local worktree_path=$1
+    local branch_name
+    branch_name=$(basename "$worktree_path")
+
+    # worktreeが現在のディレクトリかチェック
+    local current_worktree
+    current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    local target_worktree
+    target_worktree=$(realpath "$worktree_path" 2>/dev/null || echo "$worktree_path")
+
+    if [ "$current_worktree" = "$target_worktree" ]; then
+        warning_msg "スキップ: 現在いるworktreeは削除できません: $worktree_path"
+        return
+    fi
+
+    # worktree削除 (強制)
+    info_msg "worktreeを削除中: $worktree_path"
+    if git worktree remove --force "$worktree_path" >/dev/null 2>&1; then
+        success_msg "  ✓ worktreeを削除しました"
+    else
+        warning_msg "  - worktreeの削除に失敗 (既に存在しないか、Git管理外の可能性があります)"
+        # ディレクトリが残っている場合は手動削除を促す
+        if [ -d "$worktree_path" ]; then
+             warning_msg "  - ディレクトリは残っています: $worktree_path"
+        fi
+    fi
+
+    # ブランチ削除 (強制)
+    info_msg "ブランチを削除中: $branch_name"
+    if git show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
+        if git branch -D "$branch_name" >/dev/null 2>&1; then
+            success_msg "  ✓ ブランチを削除しました"
+        else
+            warning_msg "  - ブランチの削除に失敗しました"
+        fi
+    else
+        info_msg "  - 対応するブランチは存在しません"
+    fi
+    echo
+}
+
+# メイン処理
+main() {
+    if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+        error_exit "現在のディレクトリはGitリポジトリではありません。"
+    fi
+
+    # 現在のワークツリーがメインワークツリーかチェック
+    local current_worktree
+    current_worktree=$(git rev-parse --show-toplevel)
+    local main_worktree
+    main_worktree=$(git worktree list --porcelain | awk '/^worktree / {print $2; for(i=3;i<=NF;i++) printf " "$i; print ""; exit}')
+    
+    # パスを正規化して比較
+    local real_current
+    real_current=$(realpath "$current_worktree" 2>/dev/null || echo "$current_worktree")
+    local real_main
+    real_main=$(realpath "$main_worktree" 2>/dev/null || echo "$main_worktree")
+    
+    if [[ "$real_current" != "$real_main" ]]; then
+        error_exit "このコマンドはメインワークツリーでのみ実行できます。\n現在: $current_worktree\nメインワークツリー: $main_worktree"
+    fi
+
+    echo "=== Git Worktree 複数削除スクリプト ==="
+    echo
+    
+    # worktree一覧を取得
+    local worktrees=()
+    local main_worktree
+    main_worktree=$(git rev-parse --show-toplevel)
+    
+    # worktree list から非メインワークツリーのみを取得
+    # メインワークツリーとパスが異なるもののみを選択
+    while IFS= read -r path; do
+        if [[ -n "$path" ]]; then
+            # パスを正規化して比較
+            local real_path
+            real_path=$(realpath "$path" 2>/dev/null || echo "$path")
+            local real_main
+            real_main=$(realpath "$main_worktree" 2>/dev/null || echo "$main_worktree")
+            
+            # メインワークツリーでないもののみを追加
+            if [[ "$real_path" != "$real_main" ]]; then
+                worktrees+=("$path")
+            fi
+        fi
+    done < <(git worktree list --porcelain | awk '/^worktree / {path=$2; for(i=3;i<=NF;i++) path=path" "$i; print path}')
+
+    if [ ${#worktrees[@]} -eq 0 ]; then
+        info_msg "削除可能なworktreeがありません。"
+        exit 0
+    fi
+
+    # worktree一覧を表示
+    echo "削除可能なworktree一覧:"
+    for i in "${!worktrees[@]}"; do
+        printf "  %d) %s\n" "$((i + 1))" "${worktrees[$i]}"
+    done
+    echo
+    
+    # 複数選択を受け付ける
+    echo -e "${BLUE}削除するworktreeの番号を入力してください（複数の場合はスペース区切り、例: ${GREEN}1 3${BLUE}）:${NC}"
+    echo -e "${BLUE}すべて削除する場合は ${GREEN}'all'${BLUE} を入力してください。${NC}"
+    echo -e "${BLUE}キャンセルする場合は ${YELLOW}'q'${BLUE} を入力してください。${NC}"
+    echo
+    read -p "選択: " selection
+    
+    # 入力をチェック
+    if [[ "$selection" == "q" || "$selection" == "Q" ]]; then
+        echo "キャンセルしました。"
+        exit 0
+    fi
+    
+    local selected_worktrees=()
+    
+    if [[ "$selection" == "all" || "$selection" == "ALL" ]]; then
+        # すべて選択
+        selected_worktrees=("${worktrees[@]}")
+    else
+        # 番号で選択
+        for num in $selection; do
+            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#worktrees[@]}" ]; then
+                selected_worktrees+=("${worktrees[$((num - 1))]}")
+            else
+                warning_msg "無効な番号: $num (1-${#worktrees[@]}の範囲で入力してください)"
+            fi
+        done
+    fi
+    
+    # 重複を削除
+    local unique_selected=()
+    for item in "${selected_worktrees[@]}"; do
+        local found=false
+        for existing in "${unique_selected[@]}"; do
+            if [[ "$item" == "$existing" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            unique_selected+=("$item")
+        fi
+    done
+    
+    if [ ${#unique_selected[@]} -eq 0 ]; then
+        info_msg "何も選択されませんでした。"
+        exit 0
+    fi
+
+    echo
+    info_msg "以下のworktreeと関連ブランチが削除されます: "
+    for worktree in "${unique_selected[@]}"; do
+        echo "  - $worktree"
+    done
+    echo
+
+    read -p "本当に削除しますか？ (y/N): " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        echo "キャンセルしました。"
+        exit 0
+    fi
+    echo
+
+    for worktree in "${unique_selected[@]}"; do
+        perform_delete "$worktree"
+    done
+    
+    echo
+    success_msg "すべての選択されたworktreeの削除処理が完了しました！"
+    echo
+    show_worktrees
+}
+
+main "$@"

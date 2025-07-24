@@ -1,0 +1,480 @@
+#!/bin/bash
+
+# Git Worktree 作成スクリプト
+# このスクリプトは対話的にGit worktreeを作成し、開発環境をセットアップします
+
+set -euo pipefail
+
+# バージョン情報
+VERSION="2.0.0"
+
+# デフォルト設定
+DEFAULT_NUM_WORKTREES=2
+DEFAULT_SETUP_ENV=true
+DEFAULT_COPY_FILES=true
+
+# カラー定義
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# エラーメッセージを表示して終了
+error_exit() {
+    echo -e "${RED}エラー: $1${NC}" >&2
+    exit 1
+}
+
+# 成功メッセージを表示
+success_msg() {
+    echo -e "${GREEN}✓ $1${NC}" >&2
+}
+
+# 警告メッセージを表示
+warning_msg() {
+    echo -e "${YELLOW}⚠️  $1${NC}" >&2
+}
+
+# 情報メッセージを表示
+info_msg() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+# 使用方法を表示
+show_usage() {
+    echo "Git Worktree 作成スクリプト v$VERSION"
+    echo
+    echo "使用方法:"
+    echo "  $0 [オプション]"
+    echo
+    echo "オプション:"
+    echo "  -b, --base-branch BRANCH    ベースブランチを指定"
+    echo "  -n, --num-worktrees NUM     作成するworktreeの数 (1-10)"
+    echo "  -p, --base-path PATH        worktreeのベースパス"
+    echo "  --no-setup                  開発環境のセットアップをスキップ"
+    echo "  --no-copy                   ファイルコピーをスキップ"
+    echo "  -q, --quiet                 詳細出力を抑制"
+    echo "  -h, --help                  このヘルプを表示"
+    echo "  --version                   バージョン情報を表示"
+    echo
+    echo "例:"
+    echo "  $0                                    # 対話モード"
+    echo "  $0 -b main -n 3 -p ../feature-auth   # 非対話モード"
+    echo "  $0 --base-branch develop --num-worktrees 2 --base-path ../hotfix"
+}
+
+# ブランチの存在を確認
+branch_exists() {
+    local branch=$1
+    git show-ref --verify --quiet "refs/heads/$branch" || 
+    git show-ref --verify --quiet "refs/remotes/origin/$branch"
+}
+
+# ブランチ一覧を表示
+show_branches() {
+    echo "現在のローカルブランチ一覧:"
+    local local_branches=$(git branch --format="%(refname:short)" 2>/dev/null)
+    if [ -z "$local_branches" ]; then
+        echo "  (ローカルブランチがありません)"
+    else
+        echo "$local_branches" | sed 's/^/  - /'
+    fi
+    echo
+    
+    echo "リモートブランチ一覧:"
+    local remote_branches=$(git branch -r --format="%(refname:short)" 2>/dev/null | grep -v "HEAD" 2>/dev/null)
+    if [ -z "$remote_branches" ]; then
+        echo "  (リモートブランチがありません)"
+    else
+        echo "$remote_branches" | sed 's/^/  - /'
+    fi
+    echo
+}
+
+# worktree一覧を表示
+show_worktrees() {
+    echo "既存のworktree一覧:"
+    git worktree list
+    echo
+}
+
+# ベースブランチを選択
+select_base_branch() {
+    local current_branch=$(git branch --show-current)
+    local base_branch
+    
+    # 現在のブランチが空の場合（初期状態）の処理
+    if [ -z "$current_branch" ]; then
+        current_branch="HEAD"
+    fi
+    
+    while true; do
+        read -p "新しいworktreeのベースにするブランチ名を入力してください (デフォルト: $current_branch): " base_branch
+        
+        # 入力がない場合は現在のブランチを使用
+        if [ -z "$base_branch" ]; then
+            base_branch="$current_branch"
+            success_msg "現在のブランチ '$base_branch' をベースにします。"
+            echo "$base_branch"
+            return 0
+        fi
+        
+        # ローカルブランチに存在するかチェック
+        if git show-ref --verify --quiet "refs/heads/$base_branch"; then
+            success_msg "ローカルブランチ '$base_branch' をベースにします。"
+            echo "$base_branch"
+            return 0
+        # リモートブランチに存在するかチェック
+        elif git show-ref --verify --quiet "refs/remotes/origin/$base_branch"; then
+            success_msg "リモートブランチ 'origin/$base_branch' をベースにします。"
+            echo "origin/$base_branch"
+            return 0
+        else
+            warning_msg "ブランチ '$base_branch' が見つかりません。"
+            read -p "それでも続行しますか？ (y/N): " confirm
+            if [[ $confirm =~ ^[Yy]$ ]]; then
+                echo "$base_branch"
+                return 0
+            fi
+        fi
+    done
+}
+
+# 作成するworktreeの数を入力
+get_num_worktrees() {
+    local num_worktrees
+    while true; do
+        read -p "作成するworktreeの数を入力してください (1-10, デフォルト: 2): " num_worktrees
+        num_worktrees=${num_worktrees:-2}
+        if ! [[ "$num_worktrees" =~ ^[1-9]$|^10$ ]]; then
+            warning_msg "1から10の間の数値を入力してください。"
+            continue
+        fi
+        echo "$num_worktrees"
+        return 0
+    done
+}
+
+# worktreeのベースパスを入力
+get_worktree_base_path() {
+    local worktree_base_path
+    local num_worktrees=$1
+
+    while true; do
+        read -p "新しいworktreeのベースパスを入力してください (例: ../feature-login): " worktree_base_path
+        
+        if [ -z "$worktree_base_path" ]; then
+            echo "ベースパスを入力してください。"
+            continue
+        fi
+
+        local conflict=false
+        for i in $(seq 1 "$num_worktrees"); do
+            local worktree_dir="${worktree_base_path}-${i}"
+            local branch_name
+            branch_name=$(basename "$worktree_dir")
+
+            if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+                warning_msg "ブランチ '$branch_name' は既に存在します。"
+                conflict=true
+            fi
+
+            if [ -d "$worktree_dir" ]; then
+                warning_msg "ディレクトリ '$worktree_dir' は既に存在します。"
+                conflict=true
+            fi
+        done
+
+        if [ "$conflict" = true ]; then
+            read -p "競合がありますが、それでも続行しますか？ (y/N): " confirm
+            if [[ ! $confirm =~ ^[Yy]$ ]]; then
+                continue
+            fi
+        fi
+        
+        echo "$worktree_base_path"
+        return 0
+    done
+}
+
+# コマンドライン引数を解析
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -b|--base-branch)
+                BASE_BRANCH="$2"
+                shift 2
+                ;;
+            -n|--num-worktrees)
+                NUM_WORKTREES="$2"
+                if ! [[ "$NUM_WORKTREES" =~ ^[1-9]$|^10$ ]]; then
+                    error_exit "worktreeの数は1から10の間で指定してください。"
+                fi
+                shift 2
+                ;;
+            -p|--base-path)
+                WORKTREE_BASE_PATH="$2"
+                shift 2
+                ;;
+            --no-setup)
+                SETUP_ENV=false
+                shift
+                ;;
+            --no-copy)
+                COPY_FILES=false
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            --version)
+                echo "Git Worktree 作成スクリプト v$VERSION"
+                exit 0
+                ;;
+            *)
+                error_exit "不明なオプション: $1\n使用方法: $0 --help"
+                ;;
+        esac
+    done
+}
+
+# ファイルコピー処理
+copy_files_to_worktree() {
+    local worktree_path=$1
+    
+    if [ "$COPY_FILES" = false ]; then
+        return 0
+    fi
+    
+    # .gitignoreをコピー
+    if [ -f ".gitignore" ]; then
+        cp ".gitignore" "$worktree_path/"
+        [ "$QUIET" != true ] && success_msg ".gitignoreをコピーしました。"
+    fi
+
+    # .tree-copy-listに基づくファイルコピー
+    if [ -f ".tree-copy-list" ]; then
+        [ "$QUIET" != true ] && info_msg "📄 .tree-copy-listに基づいてファイルをコピー中..."
+        local copied_count=0
+        while IFS= read -r file || [[ -n "$file" ]]; do
+            if [[ -z "$file" || "$file" =~ ^[[:space:]]*$ || "$file" =~ ^# ]]; then
+                continue
+            fi
+            file=$(echo "$file" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -e "$file" ]; then
+                local target_dir="$worktree_path/$(dirname "$file")"
+                mkdir -p "$target_dir"
+                if cp -r "$file" "$target_dir/"; then
+                    [ "$QUIET" != true ] && success_msg "コピー: $file"
+                    ((copied_count++))
+                else
+                    warning_msg "コピー失敗: $file"
+                fi
+            else
+                warning_msg "ファイルが見つかりません: $file"
+            fi
+        done < ".tree-copy-list"
+        [ "$QUIET" != true ] && success_msg "$copied_count 件のファイルをコピーしました。"
+    fi
+}
+
+# 開発環境をセットアップ
+setup_development_environment() {
+    local worktree_path=$1
+    
+    if [ "$SETUP_ENV" = false ]; then
+        return 0
+    fi
+
+    # VS Codeで開く
+    if command -v code &> /dev/null; then
+        [ "$QUIET" != true ] && info_msg "📝 VS Codeでディレクトリを開いています..."
+        code "$worktree_path" &
+    else
+        [ "$QUIET" != true ] && warning_msg "VS Codeコマンドが見つかりません。"
+    fi
+    
+    # Warpの新しいウィンドウでディレクトリを開く
+    [ "$QUIET" != true ] && info_msg "🚀 Warpの新しいウィンドウでディレクトリを開いています..."
+    local absolute_worktree_path
+    absolute_worktree_path=$(cd "$worktree_path" && pwd)
+    if command -v warp &> /dev/null; then
+        [ "$QUIET" != true ] && info_msg "Warp CLIを使用します"
+        warp launch --new-window --path "$absolute_worktree_path" &
+    else
+        [ "$QUIET" != true ] && info_msg "Warp CLIが見つからないため、'open'コマンドで代替します"
+        # 'open'コマンドはより堅牢なフォールバック
+        open -a Warp "$absolute_worktree_path" &
+    fi
+
+    # yabaiがインストールされている場合はウィンドウを整理
+    if command -v yabai &> /dev/null; then
+        [ "$QUIET" != true ] && info_msg "yabaiを検出し、ウィンドウを整理後にタイルモードを解除します..."
+        # ウィンドウが開くのを少し待つ
+        sleep 1
+        # 現在のスペースのレイアウトをbsp(tiling)に変更し、ウィンドウを整理
+        # レイアウト変更が失敗する可能性もある（例: SIP設定）
+        if yabai -m space --layout bsp; then
+            yabai -m space --balance
+            # 少し待ってからフローティングモードに戻す
+            sleep 0.5
+            yabai -m space --layout float
+            [ "$QUIET" != true ] && success_msg "yabai: ウィンドウを整列し、フローティングモードに戻しました。"
+        else
+            warning_msg "yabai: レイアウトの変更に失敗しました。現在のスペースはyabaiで管理されていない可能性があります。"
+        fi
+    fi
+}
+
+# worktreeを作成
+create_worktree() {
+    local base_branch=$1
+    local num_worktrees=$2
+    local worktree_base_path=$3
+    
+    # worktree作成ループ
+    for i in $(seq 1 "$num_worktrees"); do
+        local worktree_dir="${worktree_base_path}-${i}"
+        local new_branch
+        new_branch=$(basename "$worktree_dir")
+
+        [ "$QUIET" != true ] && echo
+        [ "$QUIET" != true ] && info_msg "--- [${i}/${num_worktrees}] worktree作成中: $worktree_dir ---"
+
+        # 実行するコマンドを構築
+        local cmd="git worktree add -b $new_branch $worktree_dir $base_branch"
+        
+        [ "$QUIET" != true ] && echo "実行するコマンド:"
+        [ "$QUIET" != true ] && echo "  $cmd"
+        [ "$QUIET" != true ] && echo
+        
+        # worktree作成実行
+        if eval "$cmd" 2>/dev/null; then
+            [ "$QUIET" != true ] && success_msg "worktreeが正常に作成されました！"
+            
+            # 作成したworktreeディレクトリの絶対パスを取得
+            local worktree_path
+            worktree_path=$(realpath "$worktree_dir")
+            
+            # ファイルコピー処理
+            copy_files_to_worktree "$worktree_path"
+            
+            # 開発環境をセットアップ
+            setup_development_environment "$worktree_path"
+        else
+            error_exit "worktree '$worktree_dir' の作成に失敗しました。"
+        fi
+    done
+}
+
+# メイン処理
+main() {
+    # グローバル変数の初期化
+    BASE_BRANCH=""
+    NUM_WORKTREES=""
+    WORKTREE_BASE_PATH=""
+    SETUP_ENV=$DEFAULT_SETUP_ENV
+    COPY_FILES=$DEFAULT_COPY_FILES
+    QUIET=false
+    
+    # コマンドライン引数を解析
+    parse_arguments "$@"
+    
+    [ "$QUIET" != true ] && echo "=== Git Worktree 作成スクリプト v$VERSION ==="
+    [ "$QUIET" != true ] && echo
+    
+    # 現在のGitリポジトリかチェック
+    if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+        error_exit "現在のディレクトリはGitリポジトリではありません。"
+    fi
+    
+    # コミットが存在するかチェック
+    if ! git rev-parse HEAD >/dev/null 2>&1; then
+        error_exit "リポジトリにコミットがありません。最初に何かコミットしてください。"
+    fi
+    
+    # 非対話モードの場合は引数チェック
+    if [ -n "$BASE_BRANCH" ] && [ -n "$NUM_WORKTREES" ] && [ -n "$WORKTREE_BASE_PATH" ]; then
+        # 非対話モード
+        [ "$QUIET" != true ] && info_msg "非対話モードで実行します。"
+        
+        # 競合チェック
+        local conflict=false
+        for i in $(seq 1 "$NUM_WORKTREES"); do
+            local worktree_dir="${WORKTREE_BASE_PATH}-${i}"
+            local branch_name
+            branch_name=$(basename "$worktree_dir")
+
+            if git show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
+                warning_msg "ブランチ '$branch_name' は既に存在します。"
+                conflict=true
+            fi
+
+            if [ -d "$worktree_dir" ]; then
+                warning_msg "ディレクトリ '$worktree_dir' は既に存在します。"
+                conflict=true
+            fi
+        done
+
+        if [ "$conflict" = true ]; then
+            error_exit "競合があります。既存のブランチやディレクトリを確認してください。"
+        fi
+        
+        create_worktree "$BASE_BRANCH" "$NUM_WORKTREES" "$WORKTREE_BASE_PATH"
+    else
+        # 対話モード
+        [ "$QUIET" != true ] && info_msg "対話モードで実行します。"
+        
+        # ブランチとworktree情報を表示
+        [ "$QUIET" != true ] && show_branches
+        [ "$QUIET" != true ] && show_worktrees
+        
+        # ユーザー入力を取得
+        local base_branch=${BASE_BRANCH:-$(select_base_branch)}
+        local num_worktrees=${NUM_WORKTREES:-$(get_num_worktrees)}
+        local worktree_base_path=${WORKTREE_BASE_PATH:-$(get_worktree_base_path "$num_worktrees")}
+
+        # 設定内容の確認
+        [ "$QUIET" != true ] && echo
+        [ "$QUIET" != true ] && echo "=== 設定内容の確認 ==="
+        [ "$QUIET" != true ] && echo "ベースブランチ: $base_branch"
+        [ "$QUIET" != true ] && echo "作成するworktreeの数: $num_worktrees"
+        [ "$QUIET" != true ] && echo "worktreeのベースパス: $worktree_base_path"
+        [ "$QUIET" != true ] && echo
+        [ "$QUIET" != true ] && echo "以下のworktreeとブランチが作成されます:"
+        for i in $(seq 1 "$num_worktrees"); do
+            local worktree_dir="${worktree_base_path}-${i}"
+            local new_branch
+            new_branch=$(basename "$worktree_dir")
+            [ "$QUIET" != true ] && echo "  - worktree: $worktree_dir, ブランチ: $new_branch"
+        done
+        [ "$QUIET" != true ] && echo
+
+        # 実行確認
+        if [ "$QUIET" != true ]; then
+            read -p "これらのworktreeを作成しますか？ (Y/n): " confirm
+            if [[ $confirm =~ ^[Nn]$ ]]; then
+                echo "キャンセルしました。"
+                exit 0
+            fi
+        fi
+        
+        create_worktree "$base_branch" "$num_worktrees" "$worktree_base_path"
+    fi
+
+    [ "$QUIET" != true ] && echo
+    [ "$QUIET" != true ] && success_msg "すべてのworktreeが正常に作成されました！"
+    [ "$QUIET" != true ] && echo
+    [ "$QUIET" != true ] && echo "現在のworktree一覧:"
+    [ "$QUIET" != true ] && git worktree list
+    [ "$QUIET" != true ] && echo
+    [ "$QUIET" != true ] && info_msg "🚀 開発を開始できます！"
+}
+
+main "$@"
